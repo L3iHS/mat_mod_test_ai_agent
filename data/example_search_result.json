@@ -1,0 +1,31 @@
+{
+  "source": "GitHub Search API",
+  "source_url": "https://api.github.com/search/repositories",
+  "collected_at": "2026-04-24T20:21:47+00:00",
+  "query": "ai agents beginner archived:false",
+  "note": "Сокращенный пример структуры данных. Полные результаты новых запусков сохраняются в data/generated/.",
+  "repositories": [
+    {
+      "full_name": "microsoft/ai-agents-for-beginners",
+      "html_url": "https://github.com/microsoft/ai-agents-for-beginners",
+      "description": "12 Lessons to Get Started Building AI Agents",
+      "language": "Jupyter Notebook",
+      "stars": 59185,
+      "forks": 20088,
+      "open_issues": 4,
+      "updated_at": "2026-04-24T19:25:39Z",
+      "topics": ["ai-agents", "generative-ai", "semantic-kernel"]
+    },
+    {
+      "full_name": "microsoft/edgeai-for-beginners",
+      "html_url": "https://github.com/microsoft/edgeai-for-beginners",
+      "description": "Beginner course about Edge AI and intelligent agents",
+      "language": "Jupyter Notebook",
+      "stars": 1419,
+      "forks": 301,
+      "open_issues": 0,
+      "updated_at": "2026-04-23T17:08:43Z",
+      "topics": []
+    }
+  ]
+}
