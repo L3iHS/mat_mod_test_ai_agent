@@ -231,4 +231,5 @@ pyrightconfig.json
 
 # Project generated data
 data/generated/*.json
+reports/*.md
 .vscode/

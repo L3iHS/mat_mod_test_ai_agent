@@ -8,12 +8,27 @@ from dataclasses import asdict
 from typing import Any
 
 from agent.config import PROJECT_ROOT, Settings, get_settings
-from agent.llm import ChatMessage, LLMError, OpenAICompatibleClient, extract_json_object
+from agent.llm import (
+    ChatMessage,
+    LLMAuthError,
+    LLMError,
+    OpenAICompatibleClient,
+    extract_json_object,
+    list_github_models,
+)
 from tools.github_tools import (
     Repository,
+    fetch_repository_readme,
+    get_repository_info,
     list_user_repositories,
     rank_repositories,
     search_github_repositories,
+)
+from tools.report_tools import (
+    ReadmeEvaluation,
+    evaluate_readme_quality,
+    print_repository_table,
+    write_markdown_report,
 )
 
 
@@ -37,7 +52,9 @@ PLANNER_SYSTEM_PROMPT = """Ты управляешь агентом RepoScout.
 ANSWER_SYSTEM_PROMPT = """Ты RepoScout, спокойный инженерный помощник.
 У тебя есть реальные данные из GitHub API и результат локального ранжирования.
 Отвечай по-русски, без рекламного тона.
-Объясни, какие проекты стоит смотреть первыми и почему.
+Отвечай кратко: 3-5 пунктов и короткий итог.
+Не пересказывай всю таблицу, она уже показана в CLI.
+Назови лучший вариант, 1-2 альтернативы и почему.
 Не скрывай ограничения: stars не равны качеству, GitHub Search может вернуть шум.
 """
 
@@ -117,14 +134,20 @@ def handle_command(
     if name == "/tools":
         print_tools()
         return True
-    if name == "/skills":
+    if name == "/skills" and len(parts) == 1:
         print_skills(enabled_skills)
+        return True
+    if name == "/skills":
+        print("Команда /skills только показывает список. Для изменения используй /skill on/off <name>.")
         return True
     if name == "/skill":
         update_skill(parts, enabled_skills)
         return True
     if name == "/llm":
         check_llm(command, client)
+        return True
+    if name == "/models":
+        print_available_models(client)
         return True
 
     print("Неизвестная команда. Напиши /help, чтобы увидеть список команд.")
@@ -142,6 +165,7 @@ def print_help() -> None:
                 "/skill on <name> — включить skill",
                 "/skill off <name> — выключить skill",
                 "/llm <текст> — проверить LLM без инструментов",
+                "/models — показать доступные GitHub Models",
                 "/exit — выйти",
                 "",
                 "Обычный текст без / считается запросом к агенту.",
@@ -156,8 +180,14 @@ def print_tools() -> None:
             [
                 "Инструменты:",
                 "search_github_repositories — ищет репозитории через GitHub API",
+                "get_repository_info — получает метаданные конкретного GitHub-репозитория",
+                "fetch_repository_readme — получает README конкретного репозитория",
                 "list_user_repositories — получает публичные репозитории пользователя GitHub",
                 "rank_repositories — ранжирует найденные репозитории",
+                "evaluate_readme_quality — оценивает README по чеклисту",
+                "render_markdown_repository_table — строит Markdown-таблицу для отчета",
+                "print_repository_table — выводит таблицу через rich",
+                "write_markdown_report — сохраняет отчет в reports/",
             ]
         )
     )
@@ -183,10 +213,10 @@ def update_skill(parts: list[str], enabled_skills: set[str]) -> None:
 
     if parts[1] == "on":
         enabled_skills.add(skill_name)
-        print(f"Skill включен: {skill_name}")
+        print(f"[skill] {skill_name}: on")
     else:
         enabled_skills.discard(skill_name)
-        print(f"Skill выключен: {skill_name}")
+        print(f"[skill] {skill_name}: off")
 
 
 def check_llm(command: str, client: OpenAICompatibleClient | None) -> None:
@@ -207,10 +237,40 @@ def check_llm(command: str, client: OpenAICompatibleClient | None) -> None:
             temperature=0.2,
         )
     except LLMError as exc:
-        print(f"LLM не ответила: {exc}")
+        print(format_llm_error(exc))
         return
 
     print(answer)
+
+
+def print_available_models(client: OpenAICompatibleClient | None) -> None:
+    if client is None:
+        print("LLM-клиент не настроен. Проверь .env и не запускай с --offline.")
+        return
+    if "models.github.ai" not in client.base_url:
+        print("Команда /models сейчас показывает каталог только для GitHub Models.")
+        print("Для GitHub Models нужно: LLM_BASE_URL=https://models.github.ai/inference")
+        return
+
+    try:
+        models = list_github_models(client.api_key)
+    except LLMError as exc:
+        print(format_llm_error(exc))
+        return
+
+    print("Доступные GitHub Models:")
+    for model in models[:12]:
+        limits = model.get("limits") or {}
+        capabilities = ", ".join(model.get("capabilities") or [])
+        print(
+            f"- {model.get('id')} | {model.get('name')} | "
+            f"tier: {model.get('rate_limit_tier', 'n/a')} | "
+            f"input: {limits.get('max_input_tokens', 'n/a')} | "
+            f"output: {limits.get('max_output_tokens', 'n/a')} | "
+            f"{capabilities or 'без capabilities'}"
+        )
+    if len(models) > 12:
+        print(f"...и еще {len(models) - 12} моделей")
 
 
 def run_request(
@@ -221,26 +281,48 @@ def run_request(
     limit: int,
     enabled_skills: set[str] | None = None,
 ) -> int:
+    print()
+    print("─" * 72)
     print("RepoScout")
     print(f"Запрос: {user_prompt}")
     print()
 
-    skill_text = load_skill_text(enabled_skills or set())
+    active_skills = enabled_skills or set()
+    print_active_skills(active_skills)
+    skill_text = load_skill_text(active_skills)
+
+    github_repo = extract_github_repo(user_prompt)
+    if github_repo:
+        return run_github_repo_request(user_prompt, github_repo, client, settings, skill_text=skill_text)
 
     github_user = extract_github_user(user_prompt)
     if github_user:
         return run_github_user_request(user_prompt, github_user, client, settings, limit=limit, skill_text=skill_text)
 
-    plan = build_plan(user_prompt, client, fallback_limit=limit, skill_text=skill_text)
+    try:
+        plan = build_plan(user_prompt, client, fallback_limit=limit, skill_text=skill_text)
+    except LLMAuthError as exc:
+        print(format_llm_error(exc))
+        return 1
+
     if plan.get("action") == "answer_directly":
         print(plan.get("answer", "Я лучше всего умею искать GitHub-репозитории по теме."))
         return 0
 
-    query = str(plan.get("query") or fallback_query(user_prompt))
+    if plan.get("action") == "unsupported":
+        print(plan["answer"])
+        return 0
+
+    query = str(plan.get("query") or fallback_query(user_prompt) or "")
+    if not query:
+        print("Сейчас я умею анализировать GitHub-репозитории и искать проекты на GitHub.")
+        print("Пример: найди GitHub-проекты про AI agents для новичка")
+        return 0
     limit = int(plan.get("limit") or limit)
     goal = str(plan.get("goal") or user_prompt)
 
-    print(f"[инструмент] search_github_repositories(запрос={query!r}, лимит={limit})")
+    print_section("Tools")
+    print(f"[tool] search_github_repositories(query={query!r}, limit={limit})")
     try:
         repositories = search_github_repositories(
             query,
@@ -256,11 +338,81 @@ def run_request(
         print("GitHub ничего не вернул. Попробуй переформулировать запрос.")
         return 1
 
-    print(f"[инструмент] rank_repositories(репозитории={len(repositories)}, цель={goal!r})")
+    print(f"[tool] rank_repositories(repositories={len(repositories)}, goal={goal!r})")
     ranked = rank_repositories(repositories, goal)
     print()
 
+    report_path = save_report(
+        title="github_search",
+        query=query,
+        repositories=ranked[:5],
+        settings=settings,
+    )
+    print_section("Сравнение")
+    print_repository_table(ranked[:5])
+    print(f"\n[tool] write_markdown_report(path='{report_path}')")
+
     answer = build_answer(user_prompt, query, ranked[:5], client, skill_text=skill_text)
+    print_section("Ответ")
+    print(answer)
+    return 0
+
+
+def run_github_repo_request(
+    user_prompt: str,
+    full_name: str,
+    client: OpenAICompatibleClient | None,
+    settings: Settings,
+    *,
+    skill_text: str,
+) -> int:
+    print_section("Tools")
+    print(f"[tool] get_repository_info(full_name={full_name!r})")
+    try:
+        repository = get_repository_info(
+            full_name,
+            token=settings.github_token,
+            data_dir=settings.data_dir,
+        )
+    except RuntimeError as exc:
+        print(f"Не получилось вызвать GitHub API: {exc}")
+        print("Проверь ссылку, интернет, лимит GitHub API или добавь GITHUB_TOKEN в .env.")
+        return 1
+
+    print("[tool] rank_repositories(repositories=1, goal='оценить конкретный репозиторий')")
+    ranked = rank_repositories([repository], user_prompt)
+    print()
+
+    readme_evaluation = fetch_and_evaluate_readme(full_name, settings)
+    report_path = save_report(
+        title=f"repo_{full_name.replace('/', '_')}",
+        query=f"repo:{full_name}",
+        repositories=ranked,
+        settings=settings,
+        readme_evaluation=readme_evaluation,
+    )
+
+    print_section("Сравнение")
+    print_repository_table(ranked)
+    if readme_evaluation:
+        print()
+        print(
+            "[tool] evaluate_readme_quality("
+            f"verdict='{readme_evaluation.verdict}', score={readme_evaluation.score})"
+        )
+        print(f"README: {readme_evaluation.verdict}, {readme_evaluation.score}/100")
+        if readme_evaluation.missing:
+            print("Не хватает:", ", ".join(readme_evaluation.missing))
+    print(f"\n[tool] write_markdown_report(path='{report_path}')")
+
+    answer = build_answer(
+        user_prompt,
+        f"repo:{full_name}",
+        ranked,
+        client,
+        skill_text=skill_text,
+    )
+    print_section("Ответ")
     print(answer)
     return 0
 
@@ -274,7 +426,8 @@ def run_github_user_request(
     limit: int,
     skill_text: str,
 ) -> int:
-    print(f"[инструмент] list_user_repositories(username={username!r}, лимит={limit})")
+    print_section("Tools")
+    print(f"[tool] list_user_repositories(username={username!r}, limit={limit})")
     try:
         repositories = list_user_repositories(
             username,
@@ -291,9 +444,19 @@ def run_github_user_request(
         print("У пользователя не найдено публичных репозиториев.")
         return 1
 
-    print(f"[инструмент] rank_repositories(репозитории={len(repositories)}, цель={user_prompt!r})")
+    print(f"[tool] rank_repositories(repositories={len(repositories)}, goal={user_prompt!r})")
     ranked = rank_repositories(repositories, user_prompt)
     print()
+
+    report_path = save_report(
+        title=f"user_{username}",
+        query=f"user:{username}",
+        repositories=ranked[:5],
+        settings=settings,
+    )
+    print_section("Сравнение")
+    print_repository_table(ranked[:5])
+    print(f"\n[tool] write_markdown_report(path='{report_path}')")
 
     answer = build_answer(
         user_prompt,
@@ -302,8 +465,40 @@ def run_github_user_request(
         client,
         skill_text=skill_text,
     )
+    print_section("Ответ")
     print(answer)
     return 0
+
+
+def fetch_and_evaluate_readme(full_name: str, settings: Settings) -> ReadmeEvaluation | None:
+    print(f"[tool] fetch_repository_readme(full_name={full_name!r})")
+    try:
+        readme_text = fetch_repository_readme(full_name, token=settings.github_token)
+    except RuntimeError as exc:
+        print(f"README не удалось получить: {exc}")
+        return None
+    if not readme_text:
+        print("README не найден.")
+        return None
+    return evaluate_readme_quality(readme_text)
+
+
+def save_report(
+    *,
+    title: str,
+    query: str,
+    repositories: list[Repository],
+    settings: Settings,
+    readme_evaluation: ReadmeEvaluation | None = None,
+) -> str:
+    path = write_markdown_report(
+        title=title,
+        query=query,
+        repositories=repositories,
+        reports_dir=PROJECT_ROOT / "reports",
+        readme_evaluation=readme_evaluation,
+    )
+    return str(path.relative_to(PROJECT_ROOT))
 
 
 def load_skill_text(enabled_skills: set[str]) -> str:
@@ -318,6 +513,18 @@ def load_skill_text(enabled_skills: set[str]) -> str:
     if not chunks:
         return ""
     return "Активные skill-режимы:\n" + "\n\n".join(chunks)
+
+
+def print_active_skills(enabled_skills: set[str]) -> None:
+    if not enabled_skills:
+        print("[skill] none")
+        return
+    print(f"[skill] active: {', '.join(sorted(enabled_skills))}")
+
+
+def print_section(title: str) -> None:
+    print()
+    print(f"### {title}")
 
 
 def build_plan(
@@ -346,12 +553,24 @@ def build_plan(
         plan = extract_json_object(raw)
         if plan.get("action") in {"search_github", "answer_directly"}:
             return plan
+    except LLMAuthError:
+        raise
     except (LLMError, ValueError, json.JSONDecodeError) as exc:
         print(f"[предупреждение] LLM-планировщик не ответил, используется простой планировщик: {exc}", file=sys.stderr)
 
+    fallback = fallback_query(user_prompt)
+    if not fallback:
+        return {
+            "action": "unsupported",
+            "answer": (
+                "Сейчас я умею анализировать GitHub-репозитории и искать проекты на GitHub. "
+                "Запрос не похож на GitHub-сценарий, поэтому я не буду подставлять случайный поиск."
+            ),
+        }
+
     return {
         "action": "search_github",
-        "query": fallback_query(user_prompt),
+        "query": fallback,
         "limit": fallback_limit,
         "goal": user_prompt,
     }
@@ -394,25 +613,22 @@ def join_prompt(base_prompt: str, extra_text: str) -> str:
 
 def render_template_answer(query: str, repositories: list[Repository]) -> str:
     lines = [
-        f"Я поискал на GitHub по запросу: {query}",
-        "",
-        "Короткий список, с чего начать:",
+        f"GitHub-запрос: {query}",
+        "Топ результатов:",
     ]
-    for index, repo in enumerate(repositories, start=1):
+    for index, repo in enumerate(repositories[:3], start=1):
         notes = "; ".join(repo.score_notes or [])
         lines.extend(
             [
-                f"{index}. {repo.full_name} — оценка {repo.score}",
-                f"   {repo.html_url}",
-                f"   Язык: {repo.language or 'не указан'}, звезд: {repo.stars}, форков: {repo.forks}",
-                f"   Почему в списке: {notes}.",
+                f"{index}. {repo.full_name} — {repo.html_url}",
+                f"   Оценка: {repo.score}; язык: {repo.language or 'не указан'}; звезд: {repo.stars}",
+                f"   Причина: {notes}.",
             ]
         )
     lines.extend(
         [
             "",
-            "Ограничение: это первичный отбор по публичным метрикам GitHub.",
-            "Перед реальным выбором стоит открыть README и посмотреть, насколько проект живой и понятный.",
+            "Это первичный отбор по публичным метрикам GitHub. README все равно нужно открыть вручную.",
         ]
     )
     return "\n".join(lines)
@@ -420,6 +636,9 @@ def render_template_answer(query: str, repositories: list[Repository]) -> str:
 
 def fallback_query(user_prompt: str) -> str:
     lowered = user_prompt.lower()
+    if not looks_like_github_task(lowered):
+        return ""
+
     replacements = {
         "искусственный интеллект": "artificial intelligence",
         "ии": "ai",
@@ -450,8 +669,36 @@ def fallback_query(user_prompt: str) -> str:
     }
     useful = [word for word in words if word not in stop_words]
     if not useful:
-        return "ai agents beginner"
+        return ""
     return " ".join(useful[:8])
+
+
+def looks_like_github_task(text: str) -> bool:
+    github_markers = {
+        "github",
+        "repo",
+        "repos",
+        "repository",
+        "repositories",
+        "репо",
+        "репозитор",
+        "проект",
+        "проекты",
+        "найди",
+        "подбери",
+        "изучать",
+    }
+    return any(marker in text for marker in github_markers)
+
+
+def format_llm_error(error: LLMError) -> str:
+    if isinstance(error, LLMAuthError):
+        return (
+            "LLM не авторизовалась: провайдер вернул 401/403. "
+            "Проверь, что в .env указан правильный LLM_API_KEY, "
+            "что ключ активен в AgentRouter и что выбранная модель доступна этому ключу."
+        )
+    return f"LLM не ответила: {error}"
 
 
 def extract_github_user(text: str) -> str | None:
@@ -463,6 +710,17 @@ def extract_github_user(text: str) -> str | None:
     if username.lower() in reserved:
         return None
     return username
+
+
+def extract_github_repo(text: str) -> str | None:
+    match = re.search(r"https?://github\.com/([A-Za-z0-9-]+)/([A-Za-z0-9_.-]+)(?:[/?#]|$)", text)
+    if not match:
+        return None
+    owner, repo = match.group(1), match.group(2)
+    reserved_repos = {"repositories", "projects", "packages", "stars", "followers", "following"}
+    if repo.lower() in reserved_repos:
+        return None
+    return f"{owner}/{repo}"
 
 
 if __name__ == "__main__":

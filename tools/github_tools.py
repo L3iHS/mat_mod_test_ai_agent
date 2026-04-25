@@ -162,6 +162,46 @@ def list_user_repositories(
     return repos
 
 
+def get_repository_info(
+    full_name: str,
+    *,
+    token: str | None = None,
+    data_dir: Path | None = None,
+) -> Repository:
+    """Инструмент: получает метаданные конкретного GitHub-репозитория"""
+    clean_full_name = full_name.strip()
+    encoded = urllib.parse.quote(clean_full_name, safe="/")
+    item = _github_get(f"/repos/{encoded}", token=token)
+    repo = Repository(
+        name=item.get("name", ""),
+        full_name=item.get("full_name", ""),
+        html_url=item.get("html_url", ""),
+        description=item.get("description") or "",
+        language=item.get("language"),
+        stars=int(item.get("stargazers_count") or 0),
+        forks=int(item.get("forks_count") or 0),
+        open_issues=int(item.get("open_issues_count") or 0),
+        updated_at=item.get("updated_at", ""),
+        pushed_at=item.get("pushed_at", ""),
+        topics=list(item.get("topics") or []),
+    )
+
+    if data_dir:
+        data_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        safe_name = clean_full_name.replace("/", "_")
+        output_path = data_dir / f"github_repo_{safe_name}_{stamp}.json"
+        payload = {
+            "source": "GitHub Repository API",
+            "source_url": f"{GITHUB_API}/repos/{clean_full_name}",
+            "collected_at": datetime.now(timezone.utc).isoformat(),
+            "repository": asdict(repo),
+        }
+        output_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    return repo
+
+
 def fetch_repository_readme(full_name: str, *, token: str | None = None) -> str:
     """Дополнительный инструмент: получает README выбранного репозитория"""
     encoded = urllib.parse.quote(full_name, safe="/")

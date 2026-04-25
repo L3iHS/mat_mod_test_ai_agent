@@ -11,6 +11,10 @@ class LLMError(RuntimeError):
     pass
 
 
+class LLMAuthError(LLMError):
+    pass
+
+
 @dataclass
 class ChatMessage:
     role: str
@@ -46,6 +50,8 @@ class OpenAICompatibleClient:
                 data = json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             body = exc.read().decode("utf-8", errors="replace")
+            if exc.code in {401, 403}:
+                raise LLMAuthError(f"LLM HTTP {exc.code}: {body}") from exc
             raise LLMError(f"LLM HTTP {exc.code}: {body}") from exc
         except urllib.error.URLError as exc:
             raise LLMError(f"Запрос к LLM не удался: {exc.reason}") from exc
@@ -54,6 +60,34 @@ class OpenAICompatibleClient:
             return data["choices"][0]["message"]["content"].strip()
         except (KeyError, IndexError, TypeError) as exc:
             raise LLMError(f"Неожиданный ответ LLM: {data}") from exc
+
+
+def list_github_models(api_key: str) -> list[dict[str, Any]]:
+    """Получает каталог моделей GitHub Models"""
+    request = urllib.request.Request(
+        "https://models.github.ai/catalog/models",
+        headers={
+            "Accept": "application/vnd.github+json",
+            "Authorization": f"Bearer {api_key}",
+            "X-GitHub-Api-Version": "2026-03-10",
+        },
+        method="GET",
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        if exc.code in {401, 403}:
+            raise LLMAuthError(f"GitHub Models HTTP {exc.code}: {body}") from exc
+        raise LLMError(f"GitHub Models HTTP {exc.code}: {body}") from exc
+    except urllib.error.URLError as exc:
+        raise LLMError(f"Запрос к каталогу GitHub Models не удался: {exc.reason}") from exc
+
+    if not isinstance(data, list):
+        raise LLMError(f"Неожиданный ответ каталога GitHub Models: {data}")
+    return data
 
 
 def extract_json_object(text: str) -> dict[str, Any]:

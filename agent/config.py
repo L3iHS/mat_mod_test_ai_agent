@@ -4,23 +4,24 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    load_dotenv = None
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
-def load_dotenv(path: Path | None = None) -> None:
+def load_environment(path: Path | None = None) -> None:
     """Минимальный загрузчик .env, чтобы не добавлять отдельную зависимость"""
     env_path = path or PROJECT_ROOT / ".env"
     if not env_path.exists():
         return
 
-    try:
-        from dotenv import load_dotenv as load_python_dotenv
-
-        load_python_dotenv(env_path, override=False)
+    if load_dotenv:
+        load_dotenv(env_path, override=False)
         return
-    except ImportError:
-        pass
 
     for raw_line in env_path.read_text(encoding="utf-8").splitlines():
         line = raw_line.strip()
@@ -42,9 +43,13 @@ class Settings:
 
 
 def get_settings() -> Settings:
-    load_dotenv()
+    load_environment()
     return Settings(
-        llm_api_key=os.getenv("LLM_API_KEY") or os.getenv("AGENT_ROUTER_API_KEY"),
+        llm_api_key=(
+            os.getenv("LLM_API_KEY")
+            or os.getenv("AGENT_ROUTER_TOKEN")
+            or os.getenv("AGENT_ROUTER_API_KEY")
+        ),
         llm_base_url=os.getenv("LLM_BASE_URL", "https://agentrouter.org/v1").rstrip("/"),
         llm_model=os.getenv("LLM_MODEL", "claude-haiku-4-5-20251001"),
         github_token=os.getenv("GITHUB_TOKEN"),
